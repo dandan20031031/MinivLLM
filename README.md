@@ -15,6 +15,8 @@ Benchmarking on flash attention in prefilling time and paged attention in decodi
 
 **New to vLLM?** Check out [HowToApproachvLLM.md](HowToApproachvLLM.md) for a step-by-step implementation guide covering layers, models, paged attention, CUDA graphs, and scheduling.
 
+> **Fork:** this copy tracks [Wenyueh/MinivLLM](https://github.com/Wenyueh/MinivLLM) and adds Windows/sm_120 support, decode CUDA-graph fixes, and profiling tooling. See [FORK_NOTES.md](FORK_NOTES.md).
+
 ## Quickstart
 
 ```bash

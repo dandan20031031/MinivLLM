@@ -15,6 +15,8 @@
 
 **第一次接触vLLM?** 阅读 [HowToApproachvLLM_zh.md](HowToApproachvLLM_zh.md) 从零开始实现vLLM！学习vLLM中layers、models、Pageattention、FlashAttention、CUDA graphs以及调度实现。
 
+> **本仓库为 fork**：跟随上游 [Wenyueh/MinivLLM](https://github.com/Wenyueh/MinivLLM)，额外提供 Windows/sm_120 支持、解码阶段 CUDA Graph 修复与性能剖析工具。详见 [FORK_NOTES.md](FORK_NOTES.md)。
+
 ## 快速开始
 
 ```bash

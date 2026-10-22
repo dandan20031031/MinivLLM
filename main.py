@@ -41,7 +41,7 @@ config = {
 }
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.environ.get("HF_TOKENIZER_CACHE", os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     model_name = config.get('model_name_or_path', 'Qwen/Qwen3-0.6B')
     tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=path)
     llm = LLM(config=config)
