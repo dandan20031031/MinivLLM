@@ -2,7 +2,6 @@ import time
 import os
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
 
 from transformers import AutoTokenizer,AutoModelForCausalLM
 
@@ -10,20 +9,21 @@ from transformers import AutoTokenizer,AutoModelForCausalLM
 from myvllm.engine.llm_engine import LLMEngine as MiniLLM
 from myvllm.sampling_parameters import SamplingParams as MiniSamplingParams
 
-# ===== vllm =====
-from vllm import LLM as VLLM
-from vllm import SamplingParams as VLLMSamplingParams
+# ===== vllm (optional, lazily imported) =====
 
 
 
 config = {
     'max_num_sequences': 16,
+    'max_num_seqs': 16,
     'max_num_batched_tokens': 1024,
     'max_cached_blocks': 1024,
     'block_size': 256,
     'world_size': 1,
-    'model_name_or_path': 'Qwen/Qwen3-0.6B',
-    'enforce_eager': True,
+    # Model path: a local checkpoint directory or a Hugging Face repo id.
+    # Override with MODEL_PATH=/path/to/Qwen3-0.6B to avoid re-downloading.
+    'model_name_or_path': os.environ.get("MODEL_PATH", "Qwen/Qwen3-0.6B"),
+    'enforce_eager': os.environ.get("ENFORCE_EAGER", "0") == "1",
     'vocab_size': 151936,  # Fixed: was 151643, HF model uses 151936
     'hidden_size': 1024,
     'num_heads': 16,
@@ -44,7 +44,7 @@ config = {
     'eos': 151645,  # Fixed: should match tokenizer.eos_token_id
 }
 
-MODEL_NAME = "Qwen/Qwen3-0.6B"
+MODEL_NAME = config['model_name_or_path']
 PROMPTS = [
     "introduce yourself" ,
     "list all prime numbers within 100" ,
@@ -52,7 +52,13 @@ PROMPTS = [
 ]
 
 WARMUP_STEPS = 2
+TIMED_RUNS = 3  # 每个 batch 档计时次数，取中位数
+COOLDOWN_SECS = 3  # 档间冷却，避免 GPU 频率漂移影响下一档数据
 OUTPUT_TOKENS = 256  # ouput token num
+# 批规模扫描：逗号分隔，如 "3,8,16"；默认 "3" 保持与历史基线可比
+BATCH_SIZES = [int(x) for x in os.environ.get("BATCH_SIZES", "3").split(",") if x.strip()]
+# transformers 对照默认关闭（bs=16 时耗时过长且基线已测），需要时置 1
+RUN_TRANSFORMERS = os.environ.get("RUN_TRANSFORMERS", "0") == "1"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def cuda_sync():
@@ -60,45 +66,78 @@ def cuda_sync():
         torch.cuda.synchronize()
 
 
+def build_prompts(tokenizer, n: int) -> list[str]:
+    """构造 n 条 prompt：前 3 条保持原始 PROMPTS（与历史基线严格可比），超出部分循环加变体后缀"""
+    chosen = []
+    for i in range(n):
+        p = PROMPTS[i % len(PROMPTS)]
+        if i >= len(PROMPTS):
+            p = f"{p} (variation {i // len(PROMPTS) + 1})"
+        chosen.append(p)
+    return [
+        tokenizer.apply_chat_template(
+            [{"role": "user", "content": p}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for p in chosen
+    ]
+
+
 def run_minivllm(tokenizer):
-    llm = MiniLLM(config=config)  
+    # 引擎只初始化一次，多 batch 档复用（权重加载占大头）
+    llm = MiniLLM(config=config)
     sampling = MiniSamplingParams(
         temperature=0.6,
         max_tokens=OUTPUT_TOKENS,
         max_model_length=128,
     )
 
-    prompts = [
-        tokenizer.apply_chat_template(
-            [{"role": "user", "content": p}],
-            tokenize=False,
-            add_generation_prompt=True,
+    results = {}
+    for bs in BATCH_SIZES:
+        prompts = build_prompts(tokenizer, bs)
+
+        # warmup（吸收 CUDA Graph 首次 replay 与 torch.compile 按 shape 重编译）
+        for _ in range(WARMUP_STEPS):
+            llm.generate(prompts, sampling)
+            cuda_sync()
+
+        # 计时 3 次取中位数
+        latencies, total_tokens = [], 0
+        for _ in range(TIMED_RUNS):
+            start = time.perf_counter()
+            outputs = llm.generate(prompts, sampling)
+            cuda_sync()
+            end = time.perf_counter()
+            latencies.append(end - start)
+            total_tokens = sum(len(x) for x in outputs["token_ids"])
+
+        latency = float(np.median(latencies))
+        tps = total_tokens / latency
+        results[bs] = {
+            "batch_size": bs,
+            "latency": latency,
+            "tokens": total_tokens,
+            "tps": tps,
+            "per_seq_tps": tps / bs,
+        }
+        print(
+            f"[minivllm bs={bs}] latency={latency:.3f}s tokens={total_tokens} "
+            f"aggregate_tps={tps:.1f} per_seq_tps={tps / bs:.1f}"
         )
-        for p in PROMPTS
-    ]
+        if bs == BATCH_SIZES[0]:
+            # sanity check：图内/图外 logits 若出错，生成文本会立刻退化为乱码或重复
+            print(f"  sample_output={outputs['text'][0][:100]!r}")
+        time.sleep(COOLDOWN_SECS)
 
-    # warmup
-    for _ in range(WARMUP_STEPS):
-        llm.generate(prompts, sampling)
-        cuda_sync()
-
-    start = time.perf_counter()
-    outputs = llm.generate(prompts, sampling)
-    cuda_sync()
-    end = time.perf_counter()
-
-    total_tokens = sum(len(x) for x in outputs["token_ids"])
-    latency = end - start
-
-    return {
-        "latency": latency,
-        "tokens": total_tokens,
-        "tps": total_tokens / latency,
-    }
+    return results
 
 
 def run_vllm(tokenizer):
-    # vLLM
+    # vLLM (lazily imported; skipped when not installed)
+    from vllm import LLM as VLLM
+    from vllm import SamplingParams as VLLMSamplingParams
+
     llm = VLLM(
         model=MODEL_NAME,
         tokenizer=MODEL_NAME,
@@ -175,27 +214,39 @@ def run_transformers_test(tokenizer):
 def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True, padding_side='left')
 
+    results = {}
+
     print("Running minivllm benchmark...")
-    mini = run_minivllm(tokenizer)
+    results["minivllm"] = run_minivllm(tokenizer)
 
-    print("Running vLLM benchmark...")
-    vllm = run_vllm(tokenizer)
+    try:
+        import importlib.util
+        if importlib.util.find_spec("vllm") is not None:
+            print("Running vLLM benchmark...")
+            results["vLLM"] = run_vllm(tokenizer)
+        else:
+            print("vLLM not installed, skipping.")
+    except Exception as e:
+        print(f"vLLM benchmark skipped: {type(e).__name__}: {str(e).splitlines()[0]}")
 
-    print("Running transformers benchmark...")
-    transformers = run_transformers_test(tokenizer)
-
-
-    results = {
-        "minivllm": mini,
-        "vLLM": vllm,
-        "transformers":transformers
-    }
+    if RUN_TRANSFORMERS:
+        print("Running transformers benchmark...")
+        results["transformers"] = run_transformers_test(tokenizer)
+    else:
+        print("transformers benchmark disabled (RUN_TRANSFORMERS=0), skipping.")
 
     print("\n=== Benchmark Results ===")
     for k, v in results.items():
         print(f"{k}:")
-        for kk, vv in v.items():
-            print(f"  {kk}: {vv:.4f}")
+        if k == "minivllm":
+            for bs, r in v.items():
+                print(
+                    f"  bs={bs}: latency={r['latency']:.4f} tokens={r['tokens']} "
+                    f"aggregate_tps={r['tps']:.1f} per_seq_tps={r['per_seq_tps']:.1f}"
+                )
+        else:
+            for kk, vv in v.items():
+                print(f"  {kk}: {vv:.4f}")
 
 
 
